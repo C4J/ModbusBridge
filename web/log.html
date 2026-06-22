@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<!-- Live log tail. Loads the recent backlog via /api/log/tail, then follows new lines via
+     the /events/log SSE stream. Note: a few lines written between the backlog fetch and the
+     SSE connecting may not appear in this view — acceptable for a log tail. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Modbus Bridge — Log</title>
+  <style>
+    body { font-family: Arial, Helvetica, sans-serif; margin: 1.5rem; color: #222; }
+    h1 { font-size: 1.3rem; margin: 0 0 .25rem; }
+    nav { margin-bottom: 1rem; font-size: .9rem; }
+    nav a { margin-right: 1rem; }
+    label { font-size: .85rem; color: #555; margin-left: .5rem; }
+    #log {
+      background: #1e1e1e; color: #d6d6d6; font-family: Menlo, Consolas, monospace;
+      font-size: .82rem; line-height: 1.4; padding: .75rem; border-radius: 4px;
+      height: 70vh; overflow-y: auto; white-space: pre-wrap; word-break: break-word;
+    }
+    #log .warn { color: #e8c06a; }
+    #log .error { color: #f08a7a; }
+    #conn { font-size: .85rem; margin-left: .5rem; }
+  </style>
+</head>
+<body>
+  <h1>Modbus Bridge — Log</h1>
+  <nav>
+    <a href="/">Points</a>
+    <a href="/log.html">Log</a>
+    <a href="/licence.html">Licences</a>
+    <label><input type="checkbox" id="follow" checked/> Auto-scroll</label>
+    <span id="conn"></span>
+  </nav>
+
+  <div id="log"></div>
+
+  <script>
+    const logEl = document.getElementById('log');
+    const followEl = document.getElementById('follow');
+    const connEl = document.getElementById('conn');
+    const MAX_LINES = 2000; // cap DOM growth
+
+    function classFor(line) {
+      if (/\bERROR\b/.test(line)) return 'error';
+      if (/\bWARN\b/.test(line)) return 'warn';
+      return '';
+    }
+
+    function append(line) {
+      const div = document.createElement('div');
+      const cls = classFor(line);
+      if (cls) div.className = cls;
+      div.textContent = line;
+      logEl.appendChild(div);
+      while (logEl.childElementCount > MAX_LINES) {
+        logEl.removeChild(logEl.firstChild);
+      }
+      if (followEl.checked) logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    async function loadBacklog() {
+      try {
+        const res = await fetch('/api/log/tail?lines=300');
+        const data = await res.json();
+        for (const line of data.lines) append(line);
+      } catch (e) {
+        append('[log.html] failed to load backlog: ' + e.message);
+      }
+    }
+
+    (async () => {
+      await loadBacklog();
+      const es = new EventSource('/events/log');
+      es.onopen = () => { connEl.textContent = '● following'; connEl.style.color = '#2a7d20'; };
+      es.onmessage = e => append(e.data);
+      es.onerror = () => { connEl.textContent = '● reconnecting…'; connEl.style.color = '#b00'; };
+    })();
+  </script>
+</body>
+</html>

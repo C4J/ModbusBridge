@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Configuration status="warn" name="ModbusBridge">
+
+  <Properties>
+    <Property name="LOG_DIR">./logs</Property>
+  </Properties>
+
+  <Appenders>
+    <Console name="Console" target="SYSTEM_OUT" ignoreExceptions="false">
+      <PatternLayout pattern="%d{yyyy-MM-dd HH:mm:ss} %-5p %c{1} - %m%n"/>
+    </Console>
+    <RollingFile
+      name="rollingFile"
+      fileName="${LOG_DIR}/modbusBridge.log"
+      filePattern="${LOG_DIR}/modbusBridge.%i.log.gz"
+      ignoreExceptions="false">
+      <PatternLayout>
+        <Pattern>%d{yyyy-MM-dd HH:mm:ss} %-5p %c{1} - %m%n</Pattern>
+      </PatternLayout>
+      <Policies>
+        <SizeBasedTriggeringPolicy size="10MB"/>
+      </Policies>
+      <DefaultRolloverStrategy max="5"/>
+    </RollingFile>
+  </Appenders>
+
+  <Loggers>
+    <!-- Bridge's own classes log at debug (per-point read deltas, connect/retry). -->
+    <Logger name="com.commander4j.modbusbridge" level="debug"/>
+    <!-- Keep the transport stack quiet; only surface problems. -->
+    <Logger name="io.netty" level="warn"/>
+    <Logger name="com.digitalpetri" level="info"/>
+
+    <Root level="info">
+      <AppenderRef ref="rollingFile"/>
+      <AppenderRef ref="Console"/>
+    </Root>
+  </Loggers>
+
+</Configuration>

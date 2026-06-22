@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project name="ModbusBridge" default="jar" basedir=".">
+
+    <property name="src.dir"    location="src"/>
+    <property name="build.dir"  location="bin"/>
+    <property name="lib.dir"    location="lib"/>
+    <property name="main.class" value="com.commander4j.modbusbridge.Main"/>
+    <property name="jar.file"   value="${basedir}/modbusBridge.jar"/>
+
+    <!-- Compile / run classpath: the digitalpetri Modbus stack, log4j2, and the reused
+         engine jar (modbusClient.jar). The bridge defines its own
+         com.commander4j.sys.Common, which SHADOWS the copy bundled inside
+         modbusClient.jar: at compile time javac prefers the source; at run time the
+         bridge's own classes (bin/, or the launched bridge jar) are searched before
+         modbusClient.jar on the Class-Path. Keep modbusClient.jar after the project's
+         own output so that shadowing holds. -->
+    <path id="bridge.classpath">
+        <fileset dir="${lib.dir}">
+            <include name="*.jar"/>
+        </fileset>
+    </path>
+
+    <target name="clean" description="Delete generated files">
+        <delete dir="${build.dir}"/>
+        <delete file="${jar.file}"/>
+    </target>
+
+    <target name="compile" description="Compile the Java sources">
+        <mkdir dir="${build.dir}"/>
+        <javac srcdir="${src.dir}" destdir="${build.dir}"
+               includeantruntime="false" debug="true" release="25">
+            <classpath refid="bridge.classpath"/>
+        </javac>
+    </target>
+
+    <!-- Thin jar: only this project's compiled classes, with a Class-Path manifest
+         attribute pointing at lib/*.jar (relative to the jar's own location). The jar
+         must stay in the project root next to lib/. -->
+    <target name="jar" depends="compile" description="Build an executable jar that references lib/ via the manifest">
+        <manifestclasspath property="manifest.classpath" jarfile="${jar.file}">
+            <classpath refid="bridge.classpath"/>
+        </manifestclasspath>
+        <jar destfile="${jar.file}">
+            <fileset dir="${build.dir}"/>
+            <manifest>
+                <attribute name="Main-Class" value="${main.class}"/>
+                <attribute name="Class-Path" value="${manifest.classpath}"/>
+            </manifest>
+        </jar>
+    </target>
+
+    <!-- Run from compiled classes. build.dir is FIRST on the classpath so the bridge's
+         own com.commander4j.sys.Common shadows the one inside modbusClient.jar. -->
+    <target name="run" depends="compile" description="Run the bridge from compiled classes">
+        <java classname="${main.class}" fork="true">
+            <!-- Netty 4.2.x avoids sun.misc.Unsafe (uses the FFM API), so no -Dio.netty.noUnsafe needed. -->
+            <jvmarg value="-Dlog4j2.shutdownHookEnabled=false"/>
+            <jvmarg value="-Dlog4j2.configurationFile=xml/config/log4j2.xml"/>
+            <classpath>
+                <pathelement location="${build.dir}"/>
+                <path refid="bridge.classpath"/>
+            </classpath>
+        </java>
+    </target>
+
+</project>

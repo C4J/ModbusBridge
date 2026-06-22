@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<!-- Renders the third-party licence list (GET /api/licence) as a table instead of raw JSON. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Modbus Bridge — Licences</title>
+  <style>
+    body { font-family: Arial, Helvetica, sans-serif; margin: 1.5rem; color: #222; }
+    h1 { font-size: 1.3rem; margin: 0 0 .25rem; }
+    nav { margin-bottom: 1rem; font-size: .9rem; }
+    nav a { margin-right: 1rem; }
+    table { border-collapse: collapse; width: 100%; max-width: 820px; }
+    th, td { text-align: left; padding: .4rem .6rem; border-bottom: 1px solid #e0e0e0; vertical-align: top; }
+    th { background: #f4f4f4; font-weight: 600; }
+    td.ver { font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .err { color: #b00; }
+    footer { margin-top: 1rem; font-size: .8rem; color: #888; }
+  </style>
+</head>
+<body>
+  <h1>Third-party licences</h1>
+  <nav>
+    <a href="/">Points</a>
+    <a href="/log.html">Log</a>
+    <a href="/licence.html">Licences</a>
+  </nav>
+
+  <table>
+    <thead>
+      <tr><th>Library</th><th>Version</th><th>Licence</th></tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+
+  <footer id="foot"></footer>
+
+  <script>
+    const rowsEl = document.getElementById('rows');
+    const footEl = document.getElementById('foot');
+
+    function escapeHtml(s) {
+      return String(s == null ? '' : s).replace(/[&<>"']/g, c =>
+        ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    }
+
+    (async () => {
+      try {
+        const res = await fetch('/api/licence');
+        const list = await res.json();
+        list.sort((a, b) => (a.description || '').toLowerCase().localeCompare((b.description || '').toLowerCase()));
+        for (const lic of list) {
+          const tr = document.createElement('tr');
+          tr.innerHTML =
+            '<td>' + escapeHtml(lic.description) + '</td>' +
+            '<td class="ver">' + escapeHtml(lic.version) + '</td>' +
+            '<td>' + escapeHtml(lic.type) + '</td>';
+          rowsEl.appendChild(tr);
+        }
+        footEl.textContent = list.length + ' librar' + (list.length === 1 ? 'y' : 'ies');
+      } catch (e) {
+        footEl.className = 'err';
+        footEl.textContent = 'Failed to load licences: ' + e.message;
+      }
+    })();
+  </script>
+</body>
+</html>

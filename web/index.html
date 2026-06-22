@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<!-- Live points table. Subscribes to /events (SSE) for push updates; writable points
+     (coils, holding registers) have an inline editor that PUTs /api/points/{name}. A
+     manual Refresh button is kept as a fallback if SSE is unavailable. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Commander4j Modbus Bridge</title>
+  <style>
+    body { font-family: Arial, Helvetica, sans-serif; margin: 1.5rem; color: #222; }
+    h1 { font-size: 1.3rem; margin: 0 0 .25rem; }
+    nav { margin-bottom: 1rem; font-size: .9rem; }
+    nav a { margin-right: 1rem; }
+    #status { padding: .5rem .75rem; border-radius: 4px; margin-bottom: 1rem; font-size: .9rem; }
+    .up   { background: #e3f5e1; border: 1px solid #9ccc93; }
+    .down { background: #fde2e1; border: 1px solid #e29b97; }
+    table { border-collapse: collapse; width: 100%; max-width: 820px; }
+    th, td { text-align: left; padding: .4rem .6rem; border-bottom: 1px solid #e0e0e0; }
+    th { background: #f4f4f4; font-weight: 600; }
+    td.value { font-variant-numeric: tabular-nums; font-weight: 600; }
+    tr.stale td.value { color: #b00; }
+    tr.stale td.value::after { content: " (stale)"; font-weight: 400; font-size: .8rem; color: #b00; }
+    .ro { color: #888; font-size: .85rem; }
+    input[type=number], input.coil { width: 6rem; }
+    button { cursor: pointer; }
+    .err { color: #b00; font-size: .85rem; margin-left: .5rem; }
+    .ok  { color: #2a7d20; font-size: .85rem; margin-left: .5rem; }
+    footer { margin-top: 1rem; font-size: .8rem; color: #888; }
+  </style>
+</head>
+<body>
+  <h1>Commander4j Modbus Bridge</h1>
+  <nav>
+    <a href="/">Points</a>
+    <a href="/log.html">Log</a>
+    <a href="/licence.html">Licences</a>
+    <button id="refresh" type="button">Refresh</button>
+  </nav>
+
+  <div id="status" class="down">Connecting…</div>
+
+  <table>
+    <thead>
+      <tr><th>Name</th><th>Kind</th><th>Address</th><th>Value</th><th>Set</th></tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+
+  <footer id="foot"></footer>
+
+  <script>
+    const rowsEl = document.getElementById('rows');
+    const statusEl = document.getElementById('status');
+    const footEl = document.getElementById('foot');
+
+    function fmtTime(ms) {
+      if (!ms) return 'never';
+      return new Date(ms).toLocaleTimeString();
+    }
+
+    function render(data) {
+      const conn = data.connected;
+      statusEl.className = conn ? 'up' : 'down';
+      statusEl.textContent = (conn ? 'Connected to ' : 'Disconnected — target ')
+        + data.target + ' (unit ' + data.unitId + ')'
+        + ' · last poll ' + fmtTime(data.lastPollMillis);
+
+      for (const p of data.points) {
+        let row = document.getElementById('pt-' + p.name);
+        if (!row) {
+          row = buildRow(p);
+          rowsEl.appendChild(row);
+        }
+        row.classList.toggle('stale', !!p.stale);
+        const valCell = row.querySelector('.value');
+        valCell.textContent = p.valid ? p.value : '—';
+        // Don't clobber an input the user is actively editing.
+        const input = row.querySelector('input');
+        if (input && document.activeElement !== input) {
+          input.value = p.value;
+        }
+      }
+      footEl.textContent = data.points.length + ' point(s)';
+    }
+
+    function buildRow(p) {
+      const tr = document.createElement('tr');
+      tr.id = 'pt-' + p.name;
+      tr.innerHTML =
+        '<td>' + escapeHtml(p.name) + '</td>' +
+        '<td>' + escapeHtml(p.kind) + '</td>' +
+        '<td>' + p.address + '</td>' +
+        '<td class="value"></td>' +
+        '<td class="setcell"></td>';
+      const setCell = tr.querySelector('.setcell');
+      if (p.writable) {
+        const input = document.createElement('input');
+        if (p.bit) {
+          input.type = 'number'; input.min = 0; input.max = 1; input.step = 1; input.className = 'coil';
+        } else {
+          input.type = 'number'; input.min = 0; input.max = 65535; input.step = 1;
+        }
+        const btn = document.createElement('button');
+        btn.type = 'button'; btn.textContent = 'Set';
+        const msg = document.createElement('span');
+        btn.addEventListener('click', () => writePoint(p.name, input.value, msg));
+        input.addEventListener('keydown', e => { if (e.key === 'Enter') writePoint(p.name, input.value, msg); });
+        setCell.appendChild(input);
+        setCell.appendChild(btn);
+        setCell.appendChild(msg);
+      } else {
+        setCell.innerHTML = '<span class="ro">read-only</span>';
+      }
+      return tr;
+    }
+
+    async function writePoint(name, value, msgEl) {
+      msgEl.textContent = '';
+      const n = parseInt(value, 10);
+      if (Number.isNaN(n)) { msgEl.className = 'err'; msgEl.textContent = 'not a number'; return; }
+      try {
+        const res = await fetch('/api/points/' + encodeURIComponent(name), {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ value: n })
+        });
+        if (res.ok) {
+          msgEl.className = 'ok'; msgEl.textContent = '✓';
+          setTimeout(() => { msgEl.textContent = ''; }, 1500);
+        } else {
+          const body = await res.json().catch(() => ({}));
+          msgEl.className = 'err'; msgEl.textContent = (res.status + ' ' + (body.error || res.statusText));
+        }
+      } catch (e) {
+        msgEl.className = 'err'; msgEl.textContent = e.message;
+      }
+    }
+
+    async function refresh() {
+      try {
+        const res = await fetch('/api/points');
+        render(await res.json());
+      } catch (e) {
+        statusEl.className = 'down';
+        statusEl.textContent = 'Refresh failed: ' + e.message;
+      }
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, c =>
+        ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    }
+
+    document.getElementById('refresh').addEventListener('click', refresh);
+
+    // Live push via SSE; fall back to an initial fetch so the table fills even if SSE
+    // never connects.
+    refresh();
+    const es = new EventSource('/events');
+    es.onmessage = e => { try { render(JSON.parse(e.data)); } catch (_) {} };
+    es.onerror = () => { statusEl.className = 'down'; /* browser auto-reconnects */ };
+  </script>
+</body>
+</html>
