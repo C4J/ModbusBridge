@@ -18,7 +18,7 @@ import com.commander4j.xml.JXMLDocument;
  * <b>inlined</b> as compile-time constants, so reusing it would forever report the
  * <em>client's</em> identity regardless of any runtime class shadow (JLS §13.4.9). Here
  * the app entry is built from {@link CommonBridge}, compiled into the bridge, so it
- * correctly reads "Commander4j Modbus Bridge 1.00".
+ * correctly reads the bridge's own name and version.
  *
  * <p>{@link JXMLDocument} <em>is</em> reused from the jar — it references no {@code Common}
  * and so has nothing to inline, making it safe. It reads

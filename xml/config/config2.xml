@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<config>
+  <modbus>
+    <ip>127.0.0.1</ip>
+    <port>1502</port>
+    <id>1</id>
+    <pollIntervalMs>1000</pollIntervalMs>
+    <maxHoldMs>60000</maxHoldMs>
+  </modbus>
+  <webserver>
+    <ip>0.0.0.0</ip>
+    <port>8080</port>
+  </webserver>
+  <points>
+    <!-- initialise="true" drives the point to value on first connect; off by default so a
+         fresh install never writes unexpectedly. See DOCUMENTATION.md "Startup initialisation".
+         Writable points may bound their pulse hold time with minHoldMs/maxHoldMs and pre-fill
+         the web UI with defaultHoldMs; absent, they get min 1, max = <maxHoldMs> above, and a
+         3000 ms default. See DOCUMENTATION.md "Pulse". pulse="false" (writable points only)
+         forbids pulsing a point entirely - use it on setpoint-style registers a momentary
+         set/reset cycle would corrupt; the web UI then shows no Pulse control and the
+         endpoint answers 400. Plain writes are unaffected.
+         simulate="true" detaches a point from the wire: reads/writes/pulses behave normally
+         for REST callers but touch memory only (value= seeds it, default 0) - for keeping a
+         calling application working while the physical device is out of service. Cannot be
+         combined with initialise. To take the WHOLE device offline without touching each
+         point, set <modbus enabled="false"> above - the bridge then never connects; real
+         points stay stale (writes 503) and simulated points keep working.
+         See DOCUMENTATION.md "Simulated points". -->
+    <point name="pump_run" kind="COIL" address="0" initialise="false" value="false" minHoldMs="500" maxHoldMs="10000" defaultHoldMs="3000"/>
+    <point name="tank_level" kind="HOLDING_REGISTER" address="100" initialise="false" value="0" pulse="false"/>
+    <point name="fault" kind="DISCRETE_INPUT" address="10"/>
+    <point name="flow_rate" kind="INPUT_REGISTER" address="30"/>
+  </points>
+</config>

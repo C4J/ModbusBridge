@@ -1,6 +1,8 @@
 <!DOCTYPE html>
 <!-- Live points table. Subscribes to /events (SSE) for push updates; writable points
-     (coils, holding registers) have an inline editor that PUTs /api/points/{name}. A
+     (coils, holding registers) have an inline editor that PUTs /api/points/{name}, plus a
+     Pulse control (POST /api/points/{name}/pulse) that sets the value, holds it for the
+     given time (default 3000 ms — the relay use case), then auto-resets server-side. A
      manual Refresh button is kept as a fallback if SSE is unavailable. -->
 <html lang="en">
 <head>
@@ -22,7 +24,12 @@
     tr.stale td.value { color: #b00; }
     tr.stale td.value::after { content: " (stale)"; font-weight: 400; font-size: .8rem; color: #b00; }
     .ro { color: #888; font-size: .85rem; }
+    /* Simulated points (from /api/status) — live-looking to REST callers, tagged for the operator. */
+    tr.sim td.kind::after { content: " · simulated"; font-size: .8rem; color: #888; font-style: italic; }
     input[type=number], input.coil { width: 6rem; }
+    input.hold { width: 5rem; margin-left: .75rem; }
+    .unit { font-size: .8rem; color: #888; margin-left: .15rem; }
+    td button { margin-left: .35rem; }
     button { cursor: pointer; }
     .err { color: #b00; font-size: .85rem; margin-left: .5rem; }
     .ok  { color: #2a7d20; font-size: .85rem; margin-left: .5rem; }
@@ -30,7 +37,7 @@
   </style>
 </head>
 <body>
-  <h1>Commander4j Modbus Bridge</h1>
+  <h1 id="appTitle">Commander4j Modbus Bridge</h1>
   <nav>
     <a href="/">Points</a>
     <a href="/log.html">Log</a>
@@ -42,7 +49,7 @@
 
   <table>
     <thead>
-      <tr><th>Name</th><th>Kind</th><th>Address</th><th>Value</th><th>Set</th></tr>
+      <tr><th>Name</th><th>Kind</th><th>Address</th><th>Value</th><th>Set / Pulse</th></tr>
     </thead>
     <tbody id="rows"></tbody>
   </table>
@@ -60,9 +67,15 @@
     }
 
     function render(data) {
+      if (data.appVersion) {
+        const title = data.appName + ' ' + data.appVersion;
+        document.getElementById('appTitle').textContent = title;
+        document.title = title;
+      }
       const conn = data.connected;
       statusEl.className = conn ? 'up' : 'down';
-      statusEl.textContent = (conn ? 'Connected to ' : 'Disconnected — target ')
+      statusEl.textContent = (conn ? 'Connected to '
+          : (modbusDisabled ? 'Modbus link disabled in config — target ' : 'Disconnected — target '))
         + data.target + ' (unit ' + data.unitId + ')'
         + ' · last poll ' + fmtTime(data.lastPollMillis);
 
@@ -73,6 +86,7 @@
           rowsEl.appendChild(row);
         }
         row.classList.toggle('stale', !!p.stale);
+        row.classList.toggle('sim', simulatedSet.has(p.name));
         const valCell = row.querySelector('.value');
         valCell.textContent = p.valid ? p.value : '—';
         // Don't clobber an input the user is actively editing.
@@ -89,7 +103,7 @@
       tr.id = 'pt-' + p.name;
       tr.innerHTML =
         '<td>' + escapeHtml(p.name) + '</td>' +
-        '<td>' + escapeHtml(p.kind) + '</td>' +
+        '<td class="kind">' + escapeHtml(p.kind) + '</td>' +
         '<td>' + p.address + '</td>' +
         '<td class="value"></td>' +
         '<td class="setcell"></td>';
@@ -108,6 +122,26 @@
         input.addEventListener('keydown', e => { if (e.key === 'Enter') writePoint(p.name, input.value, msg); });
         setCell.appendChild(input);
         setCell.appendChild(btn);
+        // Pulse: set the value, hold for the given time, auto-reset server-side. The
+        // reset is owned by the bridge, so closing the page mid-hold is safe. Bounds and
+        // the pre-fill come from the point's config (minHoldMs/maxHoldMs/defaultHoldMs) —
+        // absent entirely when the point is configured pulse="false", so no Pulse control.
+        if (p.minHoldMs !== undefined) {
+          const hold = document.createElement('input');
+          hold.type = 'number'; hold.min = p.minHoldMs; hold.max = p.maxHoldMs;
+          hold.step = 100; hold.value = p.defaultHoldMs;
+          hold.className = 'hold';
+          hold.title = 'hold time in ms (' + p.minHoldMs + '–' + p.maxHoldMs + ') before the automatic reset';
+          const ms = document.createElement('span');
+          ms.className = 'unit'; ms.textContent = 'ms';
+          const pbtn = document.createElement('button');
+          pbtn.type = 'button'; pbtn.textContent = 'Pulse';
+          pbtn.title = 'set the value, hold, then reset automatically';
+          pbtn.addEventListener('click', () => pulsePoint(p.name, input.value, hold.value, msg));
+          setCell.appendChild(hold);
+          setCell.appendChild(ms);
+          setCell.appendChild(pbtn);
+        }
         setCell.appendChild(msg);
       } else {
         setCell.innerHTML = '<span class="ro">read-only</span>';
@@ -137,6 +171,30 @@
       }
     }
 
+    async function pulsePoint(name, value, holdMs, msgEl) {
+      msgEl.textContent = '';
+      const n = parseInt(value, 10);
+      const h = parseInt(holdMs, 10);
+      if (Number.isNaN(n)) { msgEl.className = 'err'; msgEl.textContent = 'value is not a number'; return; }
+      if (Number.isNaN(h) || h < 1) { msgEl.className = 'err'; msgEl.textContent = 'bad hold time'; return; }
+      try {
+        const res = await fetch('/api/points/' + encodeURIComponent(name) + '/pulse', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ value: n, holdMs: h })
+        });
+        if (res.ok) {
+          msgEl.className = 'ok'; msgEl.textContent = '✓ pulsing ' + h + ' ms';
+          setTimeout(() => { msgEl.textContent = ''; }, h + 1500);
+        } else {
+          const body = await res.json().catch(() => ({}));
+          msgEl.className = 'err'; msgEl.textContent = (res.status + ' ' + (body.error || res.statusText));
+        }
+      } catch (e) {
+        msgEl.className = 'err'; msgEl.textContent = e.message;
+      }
+    }
+
     async function refresh() {
       try {
         const res = await fetch('/api/points');
@@ -153,6 +211,17 @@
     }
 
     document.getElementById('refresh').addEventListener('click', refresh);
+
+    // Operator-only diagnostics: which points are simulated, and whether the Modbus link
+    // is switched off in config. Deliberately NOT part of the points payload — the
+    // client<->bridge conversation must not reveal simulation — so fetch it separately.
+    let simulatedSet = new Set();
+    let modbusDisabled = false;
+    fetch('/api/status').then(r => r.json()).then(s => {
+      simulatedSet = new Set(s.simulatedPoints || []);
+      modbusDisabled = (s.modbusEnabled === false);
+      refresh(); // re-render so existing rows pick up the tags
+    }).catch(() => {});
 
     // Live push via SSE; fall back to an initial fetch so the table fills even if SSE
     // never connects.

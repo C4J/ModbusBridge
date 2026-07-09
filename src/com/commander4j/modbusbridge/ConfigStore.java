@@ -33,6 +33,15 @@ import com.commander4j.modbus.RegisterKind;
  */
 public final class ConfigStore
 {
+	/** Default cap on a pulse's hold time when {@code <maxHoldMs>} is absent (1 minute). */
+	static final int DEFAULT_MAX_HOLD_MS = 60000;
+
+	/**
+	 * Default pulse hold pre-fill when a point has no {@code defaultHoldMs} attribute —
+	 * sized for switching an electrical relay. Clamped into the point's min/max range.
+	 */
+	static final int DEFAULT_HOLD_MS = 3000;
+
 	private ConfigStore()
 	{
 	}
@@ -45,6 +54,7 @@ public final class ConfigStore
 		doc.getDocumentElement().normalize();
 
 		Element modbus = requireChild(doc.getDocumentElement(), "modbus");
+		boolean modbusEnabled = enabledAttr(modbus);
 		String host = text(modbus, "ip");
 		int port = intOf(modbus, "port");
 		int unitId = intOf(modbus, "id");
@@ -63,6 +73,13 @@ public final class ConfigStore
 			throw new IllegalArgumentException("pollIntervalMs too small (min 50): " + pollIntervalMs);
 		}
 
+		// Optional: existing config.xml files predate the pulse endpoint, so default it.
+		int maxHoldMs = intOpt(modbus, "maxHoldMs", DEFAULT_MAX_HOLD_MS);
+		if (maxHoldMs < 1)
+		{
+			throw new IllegalArgumentException("maxHoldMs must be at least 1 ms: " + maxHoldMs);
+		}
+
 		Element web = requireChild(doc.getDocumentElement(), "webserver");
 		String webHost = text(web, "ip");
 		int webPort = intOf(web, "port");
@@ -71,16 +88,16 @@ public final class ConfigStore
 			throw new IllegalArgumentException("webserver port out of range (1..65535): " + webPort);
 		}
 
-		List<ModbusPoint> points = readPoints(doc);
+		List<ModbusPoint> points = readPoints(doc, maxHoldMs);
 		if (points.isEmpty())
 		{
 			throw new IllegalArgumentException("config defines no <point> entries");
 		}
 
-		return new BridgeConfig(host, port, unitId, pollIntervalMs, webHost, webPort, points);
+		return new BridgeConfig(host, port, unitId, pollIntervalMs, modbusEnabled, webHost, webPort, maxHoldMs, points);
 	}
 
-	private static List<ModbusPoint> readPoints(Document doc)
+	private static List<ModbusPoint> readPoints(Document doc, int globalMaxHoldMs)
 	{
 		List<ModbusPoint> points = new ArrayList<>();
 		List<String> seen = new ArrayList<>();
@@ -90,15 +107,162 @@ public final class ConfigStore
 			Element e = (Element) nodes.item(i);
 			String name = attr(e, "name");
 			RegisterKind kind = parseKind(attr(e, "kind"), name);
-			int address = Integer.parseInt(attr(e, "address").trim());
+			int address;
+			try
+			{
+				address = Integer.parseInt(attr(e, "address").trim());
+			}
+			catch (NumberFormatException nfe)
+			{
+				throw new IllegalArgumentException("point '" + name + "' address must be an integer: " + attr(e, "address"));
+			}
 			if (seen.contains(name))
 			{
 				throw new IllegalArgumentException("duplicate point name: " + name);
 			}
 			seen.add(name);
-			points.add(new ModbusPoint(name, kind, address));
+
+			boolean writable = kind == RegisterKind.COILS || kind == RegisterKind.HOLDING_REGISTERS;
+
+			// Optional simulation: simulate="true" detaches the point from the wire — reads,
+			// writes and pulses behave normally but touch memory only. value seeds it (default 0).
+			boolean simulate = parseBool(e.getAttribute("simulate"), "simulate", name);
+
+			// Optional startup initialisation: initialise="true" value="..."
+			boolean initialise = parseBool(e.getAttribute("initialise"), "initialise", name);
+			if (simulate && initialise)
+			{
+				throw new IllegalArgumentException("point '" + name + "' cannot combine simulate=\"true\" with initialise=\"true\"");
+			}
+			int initialValue = 0;
+			if (initialise)
+			{
+				if (!writable)
+				{
+					throw new IllegalArgumentException("point '" + name + "' cannot be initialised: " + kind.name() + " is read-only");
+				}
+				String raw = e.getAttribute("value").trim();
+				if (raw.isEmpty())
+				{
+					throw new IllegalArgumentException("point '" + name + "' has initialise=\"true\" but no value attribute");
+				}
+				initialValue = parseValueAttr(kind, raw, name);
+			}
+			if (simulate)
+			{
+				String raw = e.getAttribute("value").trim();
+				if (!raw.isEmpty())
+				{
+					initialValue = parseValueAttr(kind, raw, name);
+				}
+			}
+
+			// Optional pulse opt-out: pulse="false" means this point must never be pulsed
+			// (plain writes unaffected). Absent → true. Meaningless on read-only kinds.
+			String rawPulse = e.getAttribute("pulse").trim();
+			if (!rawPulse.isEmpty() && !writable)
+			{
+				throw new IllegalArgumentException("point '" + name + "' cannot carry a pulse attribute: " + kind.name() + " is read-only");
+			}
+			boolean pulseAllowed = rawPulse.isEmpty() || parseBool(rawPulse, "pulse", name);
+
+			// Optional per-point pulse hold policy: minHoldMs / maxHoldMs / defaultHoldMs.
+			// Absent → min 1, max = the global <maxHoldMs>, default = 3000 clamped into range.
+			// Explicit values are range-checked by the ModbusPoint invariants. They may coexist
+			// with pulse="false" (kept-but-unused bounds, like value with initialise="false").
+			int minHoldMs = 0;
+			int maxHoldMs = 0;
+			int defaultHoldMs = 0;
+			boolean holdAttrs = !e.getAttribute("minHoldMs").isBlank() || !e.getAttribute("maxHoldMs").isBlank() || !e.getAttribute("defaultHoldMs").isBlank();
+			if (holdAttrs && !writable)
+			{
+				throw new IllegalArgumentException("point '" + name + "' cannot carry pulse hold attributes: " + kind.name() + " is read-only");
+			}
+			if (writable)
+			{
+				minHoldMs = intAttr(e, "minHoldMs", 1, name);
+				maxHoldMs = intAttr(e, "maxHoldMs", globalMaxHoldMs, name);
+				int clampedDefault = Math.max(minHoldMs, Math.min(DEFAULT_HOLD_MS, maxHoldMs));
+				defaultHoldMs = intAttr(e, "defaultHoldMs", clampedDefault, name);
+			}
+
+			points.add(new ModbusPoint(name, kind, address, simulate, initialise, initialValue, pulseAllowed, minHoldMs, maxHoldMs, defaultHoldMs));
 		}
 		return points;
+	}
+
+	/** Parses an optional integer attribute, returning {@code def} when absent/blank. */
+	private static int intAttr(Element e, String name, int def, String pointName)
+	{
+		String raw = e.getAttribute(name).trim();
+		if (raw.isEmpty())
+		{
+			return def;
+		}
+		try
+		{
+			return Integer.parseInt(raw);
+		}
+		catch (NumberFormatException ex)
+		{
+			throw new IllegalArgumentException("point '" + pointName + "' " + name + " must be an integer: " + raw);
+		}
+	}
+
+	/** Parses an optional boolean attribute; blank → {@code false}. Accepts true/false only. */
+	private static boolean parseBool(String raw, String attrName, String pointName)
+	{
+		String v = raw == null ? "" : raw.trim().toLowerCase();
+		return switch (v)
+		{
+			case "", "false" -> false;
+			case "true" -> true;
+			default -> throw new IllegalArgumentException("point '" + pointName + "' has invalid " + attrName + " (expected true/false): " + raw);
+		};
+	}
+
+	/**
+	 * Parses the optional {@code enabled} attribute on {@code <modbus>}; absent/blank →
+	 * {@code true} (existing configs predate the switch). {@code enabled="false"} stops the
+	 * bridge connecting at all — real points stay stale, simulated points work regardless.
+	 */
+	private static boolean enabledAttr(Element modbus)
+	{
+		String v = modbus.getAttribute("enabled").trim().toLowerCase();
+		return switch (v)
+		{
+			case "", "true" -> true;
+			case "false" -> false;
+			default -> throw new IllegalArgumentException("<modbus> enabled attribute must be true/false: " + modbus.getAttribute("enabled"));
+		};
+	}
+
+	/**
+	 * Parses the {@code value} attribute into a normalised int against the point's kind: bit
+	 * kinds (coils, discrete inputs) accept {@code true}/{@code false}/{@code 1}/{@code 0} → 1/0;
+	 * register kinds a 0..65535 integer. Used for both the initialise target (writable points
+	 * only) and the simulate seed (any kind).
+	 */
+	private static int parseValueAttr(RegisterKind kind, String raw, String pointName)
+	{
+		if (kind.bit)
+		{
+			String v = raw.toLowerCase();
+			return switch (v)
+			{
+				case "true", "1" -> 1;
+				case "false", "0" -> 0;
+				default -> throw new IllegalArgumentException("point '" + pointName + "' value must be true/false/1/0: " + raw);
+			};
+		}
+		try
+		{
+			return Integer.parseInt(raw);
+		}
+		catch (NumberFormatException ex)
+		{
+			throw new IllegalArgumentException("point '" + pointName + "' register value must be an integer 0..65535: " + raw);
+		}
 	}
 
 	/** Maps the operator-facing {@code kind} attribute to a {@link RegisterKind}. */
@@ -138,7 +302,36 @@ public final class ConfigStore
 
 	private static int intOf(Element parent, String tag)
 	{
-		return Integer.parseInt(text(parent, tag));
+		return parseIntElement(tag, text(parent, tag));
+	}
+
+	/** Reads an optional integer child element, returning {@code def} when it is absent. */
+	private static int intOpt(Element parent, String tag, int def)
+	{
+		NodeList nodes = parent.getElementsByTagName(tag);
+		if (nodes.getLength() == 0)
+		{
+			return def;
+		}
+		String t = nodes.item(0).getTextContent();
+		if (t == null || t.isBlank())
+		{
+			return def;
+		}
+		return parseIntElement(tag, t.trim());
+	}
+
+	/** Parses an element's text as an int, naming the element in the error. */
+	private static int parseIntElement(String tag, String text)
+	{
+		try
+		{
+			return Integer.parseInt(text);
+		}
+		catch (NumberFormatException e)
+		{
+			throw new IllegalArgumentException("<" + tag + "> must be an integer: " + text);
+		}
 	}
 
 	private static String attr(Element e, String name)

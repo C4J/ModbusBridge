@@ -7,6 +7,7 @@ import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.OptionalInt;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -17,10 +18,12 @@ import org.slf4j.LoggerFactory;
 import com.commander4j.modbus.ClientController;
 import com.commander4j.modbus.RegisterKind;
 import com.commander4j.modbusbridge.BridgeConfig;
+import com.commander4j.modbusbridge.CommonBridge;
 import com.commander4j.modbusbridge.Licences;
 import com.commander4j.modbusbridge.ModbusPoint;
 import com.commander4j.modbusbridge.PointService;
 import com.commander4j.modbusbridge.PointService.Sample;
+import com.commander4j.modbusbridge.PulseService;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 
@@ -52,17 +55,19 @@ public final class WebServer
 	private final BridgeConfig cfg;
 	private final PointService service;
 	private final ClientController controller;
+	private final PulseService pulse;
 	private final HttpServer http;
 
 	private final SseHub pointsHub;
 	private final SseHub logHub;
 	private final LogTailer logTailer;
 
-	public WebServer(BridgeConfig cfg, PointService service, ClientController controller) throws IOException
+	public WebServer(BridgeConfig cfg, PointService service, ClientController controller, PulseService pulse) throws IOException
 	{
 		this.cfg = cfg;
 		this.service = service;
 		this.controller = controller;
+		this.pulse = pulse;
 
 		this.pointsHub = new SseHub("points", this::pointsPayload);
 		this.logHub = new SseHub("log", null);
@@ -175,7 +180,26 @@ public final class WebServer
 			return;
 		}
 
-		String name = URLDecoder.decode(path.substring("/api/points/".length()), StandardCharsets.UTF_8);
+		String rest = path.substring("/api/points/".length());
+		if (rest.endsWith("/pulse"))
+		{
+			String pulseName = URLDecoder.decode(rest.substring(0, rest.length() - "/pulse".length()), StandardCharsets.UTF_8);
+			Sample ps = service.sample(pulseName);
+			if (ps == null)
+			{
+				sendError(ex, 404, "unknown point: " + pulseName);
+				return;
+			}
+			if (!method.equals("POST"))
+			{
+				sendError(ex, 405, "method not allowed");
+				return;
+			}
+			pulsePoint(ex, ps.point());
+			return;
+		}
+
+		String name = URLDecoder.decode(rest, StandardCharsets.UTF_8);
 		Sample s = service.sample(name);
 		if (s == null)
 		{
@@ -188,6 +212,74 @@ public final class WebServer
 			case "PUT" -> writePoint(ex, s.point());
 			default -> sendError(ex, 405, "method not allowed");
 		}
+	}
+
+	/**
+	 * Handles {@code POST /api/points/{name}/pulse} — a momentary output: set the point active,
+	 * hold, then guarantee a reset (see {@link PulseService}). Validation mirrors {@link #writePoint}
+	 * (writable kind, register range) plus the hold-time bound; the set/reset itself and its
+	 * timing are owned by {@link PulseService}.
+	 */
+	private void pulsePoint(HttpExchange ex, ModbusPoint p) throws IOException
+	{
+		if (!p.writable())
+		{
+			sendError(ex, 400, "point '" + p.name() + "' is read-only (" + p.kind().name() + ")");
+			return;
+		}
+		if (!p.pulseAllowed())
+		{
+			// Static config-level opt-out (pulse="false") — deliberately loud, never a
+			// silent no-op: the caller must not believe a relay fired somewhere.
+			sendError(ex, 400, "point '" + p.name() + "' does not allow pulsing");
+			return;
+		}
+
+		String body = new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+		int value;
+		int holdMs;
+		int restValue;
+		try
+		{
+			OptionalInt valueOpt = Json.intField(body, "value");
+			OptionalInt holdOpt = Json.intField(body, "holdMs");
+			if (valueOpt.isEmpty() || holdOpt.isEmpty())
+			{
+				sendError(ex, 400, "body must be {\"value\": N, \"holdMs\": N [, \"restValue\": N]}");
+				return;
+			}
+			value = valueOpt.getAsInt();
+			holdMs = holdOpt.getAsInt();
+			restValue = Json.intField(body, "restValue").orElse(0);
+		}
+		catch (IllegalArgumentException e)
+		{
+			sendError(ex, 400, e.getMessage());
+			return;
+		}
+
+		if (holdMs < p.minHoldMs() || holdMs > p.maxHoldMs())
+		{
+			sendError(ex, 400, "holdMs out of range (" + p.minHoldMs() + ".." + p.maxHoldMs() + ") for '" + p.name() + "': " + holdMs);
+			return;
+		}
+		if (p.kind() == RegisterKind.HOLDING_REGISTERS && (outOfRegisterRange(value) || outOfRegisterRange(restValue)))
+		{
+			sendError(ex, 400, "register value out of range (0..65535)");
+			return;
+		}
+
+		switch (pulse.pulse(p, value, holdMs, restValue))
+		{
+			case ACCEPTED -> sendJson(ex, 200, sampleJson(service.sample(p.name())).put("holdMs", holdMs).put("restValue", restValue).build());
+			case WRITE_FAILED -> sendError(ex, 503, "Modbus write failed: link down");
+			case QUEUE_FULL -> sendError(ex, 409, "too many pending pulses for '" + p.name() + "'");
+		}
+	}
+
+	private static boolean outOfRegisterRange(int value)
+	{
+		return value < 0 || value > 0xFFFF;
 	}
 
 	private void writePoint(HttpExchange ex, ModbusPoint p) throws IOException
@@ -212,6 +304,16 @@ public final class WebServer
 		if (p.kind() == RegisterKind.HOLDING_REGISTERS && (value < 0 || value > 0xFFFF))
 		{
 			sendError(ex, 400, "register value out of range (0..65535): " + value);
+			return;
+		}
+
+		if (p.simulate())
+		{
+			// Simulated point: the write is absorbed by the cache — same validation, same
+			// response shape, no wire. Callers cannot tell this from a live write.
+			service.update(p.name(), p.kind() == RegisterKind.COILS ? (value != 0 ? 1 : 0) : value);
+			log.info("Wrote {} = {} (simulated)", p.name(), value);
+			sendJson(ex, 200, sampleJson(service.sample(p.name())).build());
 			return;
 		}
 
@@ -257,13 +359,29 @@ public final class WebServer
 			sendError(ex, 405, "method not allowed");
 			return;
 		}
+		// simulatedPoints / modbusEnabled are diagnostics for the operator (the web UI tags
+		// simulated rows from them); the points payload itself deliberately carries no
+		// simulation marker so the client<->bridge conversation is unchanged.
+		Json.Arr simulated = Json.arr();
+		for (ModbusPoint p : service.points())
+		{
+			if (p.simulate())
+			{
+				simulated.add(p.name());
+			}
+		}
 		sendJson(ex, 200, Json.obj()
+			.put("appName", CommonBridge.programName)
+			.put("appVersion", CommonBridge.version)
 			.put("connected", service.isConnected())
+			.put("modbusEnabled", cfg.modbusEnabled())
 			.put("target", target())
 			.put("unitId", cfg.unitId())
 			.put("pollIntervalMs", cfg.pollIntervalMs())
+			.put("maxHoldMs", cfg.maxHoldMs())
 			.put("lastPollMillis", service.lastPollMillis())
 			.put("pointCount", service.points().size())
+			.putRaw("simulatedPoints", simulated.build())
 			.build());
 	}
 
@@ -335,6 +453,8 @@ public final class WebServer
 			arr.add(sampleJson(s));
 		}
 		return Json.obj()
+			.put("appName", CommonBridge.programName)
+			.put("appVersion", CommonBridge.version)
 			.put("connected", service.isConnected())
 			.put("target", target())
 			.put("unitId", cfg.unitId())
@@ -367,6 +487,8 @@ public final class WebServer
 		}
 		byte[] body = Files.readAllBytes(target);
 		ex.getResponseHeaders().set("Content-Type", contentType(target));
+		// Revalidate on every use so a browser never serves a stale page after an upgrade.
+		ex.getResponseHeaders().set("Cache-Control", "no-cache");
 		ex.sendResponseHeaders(200, body.length);
 		try (OutputStream os = ex.getResponseBody())
 		{
@@ -406,7 +528,7 @@ public final class WebServer
 	private static Json.Obj sampleJson(Sample s)
 	{
 		ModbusPoint p = s.point();
-		return Json.obj()
+		Json.Obj o = Json.obj()
 			.put("name", p.name())
 			.put("kind", p.kind().name())
 			.put("address", p.address())
@@ -415,6 +537,16 @@ public final class WebServer
 			.put("value", s.value())
 			.put("valid", s.valid())
 			.put("stale", s.stale());
+		if (p.writable() && p.pulseAllowed())
+		{
+			// Per-point pulse hold policy, so the web UI can bound + pre-fill its hold field.
+			// Absent entirely for pulse="false" points — no hold policy exists, which is also
+			// how clients (and index.html) discover that the point cannot be pulsed.
+			o.put("minHoldMs", p.minHoldMs())
+			 .put("maxHoldMs", p.maxHoldMs())
+			 .put("defaultHoldMs", p.defaultHoldMs());
+		}
+		return o;
 	}
 
 	private void sendJson(HttpExchange ex, int code, String json) throws IOException

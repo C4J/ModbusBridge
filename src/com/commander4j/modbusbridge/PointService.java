@@ -38,7 +38,9 @@ public final class PointService
 		this.points = List.copyOf(points);
 		for (ModbusPoint p : this.points)
 		{
-			samples.put(p.name(), new Sample(p, 0, false, true));
+			// Simulated points are born valid at their seed value and never go stale;
+			// real points start invalid/stale until the first successful read.
+			samples.put(p.name(), p.simulate() ? new Sample(p, p.initialValue(), true, false) : new Sample(p, 0, false, true));
 		}
 	}
 
@@ -108,7 +110,11 @@ public final class PointService
 		return changed;
 	}
 
-	/** Flags every sample stale (keeping its last value) — used when the link drops. */
+	/**
+	 * Flags every sample stale (keeping its last value) — used when the link drops.
+	 * Simulated points are exempt: they are not backed by the wire, so a dead link
+	 * cannot invalidate them.
+	 */
 	public void markAllStale()
 	{
 		boolean any = false;
@@ -117,7 +123,7 @@ public final class PointService
 			for (Map.Entry<String, Sample> e : samples.entrySet())
 			{
 				Sample s = e.getValue();
-				if (!s.stale())
+				if (!s.stale() && !s.point().simulate())
 				{
 					e.setValue(new Sample(s.point(), s.value(), s.valid(), true));
 					any = true;

@@ -1,5 +1,6 @@
 package com.commander4j.modbusbridge.web;
 
+import java.util.OptionalInt;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -153,6 +154,45 @@ final class Json
 			return 0;
 		}
 		return Integer.parseInt(token);
+	}
+
+	/**
+	 * Extracts an integer-valued field by name from a small JSON body, accepting
+	 * {@code true}/{@code false} as 1/0 (the same coil convenience as {@link #parseValue}).
+	 * Returns {@link OptionalInt#empty()} if the key is absent — the caller decides whether
+	 * the field is required (→ 400) or optional (→ default). Used by the pulse endpoint to
+	 * pull {@code value} / {@code holdMs} / {@code restValue} out of one body. Throws
+	 * {@link IllegalArgumentException} if the number does not fit an int (a client error,
+	 * not a server error).
+	 */
+	static OptionalInt intField(String body, String key)
+	{
+		if (body == null)
+		{
+			return OptionalInt.empty();
+		}
+		Matcher m = Pattern.compile("\"" + Pattern.quote(key) + "\"\\s*:\\s*(true|false|-?\\d+)").matcher(body);
+		if (!m.find())
+		{
+			return OptionalInt.empty();
+		}
+		String token = m.group(1);
+		if (token.equals("true"))
+		{
+			return OptionalInt.of(1);
+		}
+		if (token.equals("false"))
+		{
+			return OptionalInt.of(0);
+		}
+		try
+		{
+			return OptionalInt.of(Integer.parseInt(token));
+		}
+		catch (NumberFormatException e)
+		{
+			throw new IllegalArgumentException("'" + key + "' is out of integer range: " + token);
+		}
 	}
 
 	static String escape(String s)

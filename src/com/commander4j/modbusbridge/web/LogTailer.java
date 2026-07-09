@@ -138,8 +138,16 @@ public final class LogTailer
 			{
 				return;
 			}
-			position = raf.getFilePointer();
-			partial.append(new String(buf, 0, read, StandardCharsets.UTF_8));
+			// A multi-byte UTF-8 character can be split across two reads; decode only the
+			// complete prefix and leave the partial sequence for the next pass, else it
+			// decodes to replacement characters.
+			int complete = completeUtf8Length(buf, read);
+			if (complete == 0)
+			{
+				return; // nothing decodable yet; wait for the rest of the character
+			}
+			position += complete;
+			partial.append(new String(buf, 0, complete, StandardCharsets.UTF_8));
 
 			int nl;
 			while ((nl = partial.indexOf("\n")) >= 0)
@@ -153,5 +161,47 @@ public final class LogTailer
 				hub.broadcast(line);
 			}
 		}
+	}
+
+	/**
+	 * Length of the longest prefix of {@code buf[0..len)} that ends on a UTF-8 character
+	 * boundary. If the buffer ends mid-sequence (a lead byte with too few continuation
+	 * bytes), those trailing bytes are excluded so the caller can re-read them once the
+	 * rest has been written. Malformed input is passed through unchanged — the decoder's
+	 * replacement character is no worse than before.
+	 */
+	private static int completeUtf8Length(byte[] buf, int len)
+	{
+		int i = len - 1;
+		int trailing = 0;
+		while (i >= 0 && trailing < 3 && (buf[i] & 0xC0) == 0x80)
+		{
+			i--;
+			trailing++;
+		}
+		if (i < 0)
+		{
+			return len; // nothing but continuation bytes: malformed, let the decoder cope
+		}
+		int lead = buf[i] & 0xFF;
+		int need;
+		if (lead >= 0xF0)
+		{
+			need = 4;
+		}
+		else if (lead >= 0xE0)
+		{
+			need = 3;
+		}
+		else if (lead >= 0xC0)
+		{
+			need = 2;
+		}
+		else
+		{
+			return len; // last non-continuation byte is single-byte / malformed: nothing to hold back
+		}
+		int present = trailing + 1;
+		return present < need ? i : len;
 	}
 }

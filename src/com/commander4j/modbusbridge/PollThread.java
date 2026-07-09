@@ -4,6 +4,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.commander4j.modbus.ClientController;
+import com.commander4j.modbus.RegisterKind;
 
 /**
  * Background daemon that keeps {@link PointService} in step with the remote server.
@@ -31,6 +32,7 @@ public final class PollThread extends Thread
 
 	private volatile boolean running = true;
 	private long backoffMs = MIN_BACKOFF_MS;
+	private boolean initialised = false;
 
 	public PollThread(ClientController controller, PointService service, BridgeConfig cfg)
 	{
@@ -45,7 +47,8 @@ public final class PollThread extends Thread
 	public void run()
 	{
 		controller.setUnitId(cfg.unitId());
-		log.info("Poll thread started: target {}:{} unit {}, {} point(s), interval {} ms", cfg.host(), cfg.port(), cfg.unitId(), cfg.points().size(), cfg.pollIntervalMs());
+		long simulated = cfg.points().stream().filter(ModbusPoint::simulate).count();
+		log.info("Poll thread started: target {}:{} unit {}, {} point(s) ({} simulated), interval {} ms", cfg.host(), cfg.port(), cfg.unitId(), cfg.points().size(), simulated, cfg.pollIntervalMs());
 
 		while (running)
 		{
@@ -61,6 +64,19 @@ public final class PollThread extends Thread
 					continue;
 				}
 				backoffMs = MIN_BACKOFF_MS;
+
+				// Startup initialisation runs once, on the first successful connect. If it
+				// fails mid-pass the link is torn down and retried; it stays un-done so the
+				// next connect attempts it again. Once done it is not repeated on reconnect,
+				// so runtime REST/operator changes survive an outage.
+				if (!initialised)
+				{
+					if (!initialisePoints())
+					{
+						continue; // torn down; loop back to reconnect and retry init
+					}
+					initialised = true;
+				}
 			}
 
 			if (!pollOnce())
@@ -107,6 +123,10 @@ public final class PollThread extends Thread
 	{
 		for (ModbusPoint p : cfg.points())
 		{
+			if (p.simulate())
+			{
+				continue; // simulated points live in the cache only — never on the wire
+			}
 			try
 			{
 				int value = readPoint(p);
@@ -125,6 +145,59 @@ public final class PollThread extends Thread
 			}
 		}
 		return true;
+	}
+
+	/**
+	 * One-time startup pass: for every point flagged {@code initialise}, read the server's
+	 * current value and write the configured value only if they differ (so an already-correct
+	 * point is left untouched). Returns true if the whole pass succeeded; false if a read or
+	 * write failed, in which case the connection has been torn down (mirroring {@link #pollOnce}).
+	 */
+	private boolean initialisePoints()
+	{
+		for (ModbusPoint p : cfg.points())
+		{
+			if (!p.initialise())
+			{
+				continue;
+			}
+			try
+			{
+				int current = readPoint(p);
+				int desired = p.initialValue();
+				if (current == desired)
+				{
+					log.info("Initialise: {} already at {} — no write", p.name(), desired);
+				}
+				else
+				{
+					writeValue(p, desired);
+					log.info("Initialise: {} set to {} (was {})", p.name(), desired, current);
+				}
+				service.update(p.name(), desired);
+			}
+			catch (Exception e)
+			{
+				log.warn("Initialise of '{}' failed: {} — dropping connection", p.name(), e.getMessage());
+				service.markAllStale();
+				service.setConnected(false);
+				safeDisconnect();
+				return false;
+			}
+		}
+		return true;
+	}
+
+	private void writeValue(ModbusPoint p, int value) throws Exception
+	{
+		if (p.kind() == RegisterKind.COILS)
+		{
+			controller.writeBit(RegisterKind.COILS, p.address(), value != 0);
+		}
+		else
+		{
+			controller.writeRegister(RegisterKind.HOLDING_REGISTERS, p.address(), value);
+		}
 	}
 
 	private int readPoint(ModbusPoint p) throws Exception

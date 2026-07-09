@@ -11,11 +11,20 @@ import java.util.List;
  * @param port           remote Modbus server TCP port
  * @param unitId         Modbus unit id to address (0..247)
  * @param pollIntervalMs how often the poll thread refreshes every point
+ * @param modbusEnabled  {@code false} (via {@code <modbus enabled="false">}) stops the bridge
+ *                       connecting to the Modbus server at all — for a device that is known to
+ *                       be out of service. Real points then stay stale and writes return 503;
+ *                       simulated points are unaffected. Absent → {@code true}
  * @param webHost        bind address for the embedded HTTP server (added in step 3)
  * @param webPort        listen port for the embedded HTTP server (added in step 3)
+ * @param maxHoldMs      default upper bound on a pulse's hold time, applied to any point
+ *                       that doesn't set its own {@code maxHoldMs} attribute, so a typo
+ *                       can't energise a relay for hours; optional in the XML (defaults
+ *                       applied in {@link ConfigStore}). The enforced bounds live on each
+ *                       {@link ModbusPoint}.
  * @param points         the named points to track, in declaration order
  */
-public record BridgeConfig(String host, int port, int unitId, int pollIntervalMs, String webHost, int webPort, List<ModbusPoint> points)
+public record BridgeConfig(String host, int port, int unitId, int pollIntervalMs, boolean modbusEnabled, String webHost, int webPort, int maxHoldMs, List<ModbusPoint> points)
 {
 	public BridgeConfig
 	{
