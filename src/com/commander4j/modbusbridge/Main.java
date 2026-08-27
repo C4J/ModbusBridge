@@ -59,8 +59,21 @@ public final class Main
 			return;
 		}
 
+		if (cfg.restIds().isEmpty())
+		{
+			log.info("REST api ids: none configured (points addressable by name only)");
+		}
+		else
+		{
+			log.info("REST api ids: {} configured", cfg.restIds().size());
+			for (RestApiId id : cfg.restIds())
+			{
+				log.info("REST id [{}] -> point [{}]{}", id.name(), id.point(), id.caseSensitive() ? " (case-sensitive)" : "");
+			}
+		}
+
 		ClientController controller = new ClientController();
-		PointService service = new PointService(cfg.points());
+		PointService service = new PointService(cfg.points(), cfg.restIds());
 		PollThread poll = new PollThread(controller, service, cfg);
 		PulseService pulse = new PulseService(controller, service);
 

@@ -24,6 +24,7 @@ import com.commander4j.modbusbridge.ModbusPoint;
 import com.commander4j.modbusbridge.PointService;
 import com.commander4j.modbusbridge.PointService.Sample;
 import com.commander4j.modbusbridge.PulseService;
+import com.commander4j.modbusbridge.RestApiId;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 
@@ -195,7 +196,7 @@ public final class WebServer
 				sendError(ex, 405, "method not allowed");
 				return;
 			}
-			pulsePoint(ex, ps.point());
+			pulsePoint(ex, ps.point(), pulseName);
 			return;
 		}
 
@@ -208,8 +209,8 @@ public final class WebServer
 		}
 		switch (method)
 		{
-			case "GET" -> sendJson(ex, 200, sampleJson(s).build());
-			case "PUT" -> writePoint(ex, s.point());
+			case "GET" -> sendJson(ex, 200, sampleJson(s, name).build());
+			case "PUT" -> writePoint(ex, s.point(), name);
 			default -> sendError(ex, 405, "method not allowed");
 		}
 	}
@@ -217,21 +218,26 @@ public final class WebServer
 	/**
 	 * Handles {@code POST /api/points/{name}/pulse} — a momentary output: set the point active,
 	 * hold, then guarantee a reset (see {@link PulseService}). Validation mirrors {@link #writePoint}
-	 * (writable kind, register range) plus the hold-time bound; the set/reset itself and its
-	 * timing are owned by {@link PulseService}.
+	 * (writable kind, register range) plus the hold-time bound; {@code holdMs} may be omitted,
+	 * in which case the point's configured {@code defaultHoldMs} applies (always within the
+	 * min/max bounds by the {@link ModbusPoint} invariant). The set/reset itself and its
+	 * timing are owned by {@link PulseService}. {@code asName} is the name the caller used —
+	 * the point's own name or a restapi id — echoed in the response and every error message,
+	 * and logged so the originating lane/id stays traceable even though the wire only sees
+	 * the shared point.
 	 */
-	private void pulsePoint(HttpExchange ex, ModbusPoint p) throws IOException
+	private void pulsePoint(HttpExchange ex, ModbusPoint p, String asName) throws IOException
 	{
 		if (!p.writable())
 		{
-			sendError(ex, 400, "point '" + p.name() + "' is read-only (" + p.kind().name() + ")");
+			sendError(ex, 400, "point '" + asName + "' is read-only (" + p.kind().name() + ")");
 			return;
 		}
 		if (!p.pulseAllowed())
 		{
 			// Static config-level opt-out (pulse="false") — deliberately loud, never a
 			// silent no-op: the caller must not believe a relay fired somewhere.
-			sendError(ex, 400, "point '" + p.name() + "' does not allow pulsing");
+			sendError(ex, 400, "point '" + asName + "' does not allow pulsing");
 			return;
 		}
 
@@ -242,14 +248,15 @@ public final class WebServer
 		try
 		{
 			OptionalInt valueOpt = Json.intField(body, "value");
-			OptionalInt holdOpt = Json.intField(body, "holdMs");
-			if (valueOpt.isEmpty() || holdOpt.isEmpty())
+			if (valueOpt.isEmpty())
 			{
-				sendError(ex, 400, "body must be {\"value\": N, \"holdMs\": N [, \"restValue\": N]}");
+				sendError(ex, 400, "body must be {\"value\": N [, \"holdMs\": N, \"restValue\": N]}");
 				return;
 			}
 			value = valueOpt.getAsInt();
-			holdMs = holdOpt.getAsInt();
+			// holdMs is optional: an omitted field falls back to the point's configured
+			// defaultHoldMs, so callers can leave the relay timing to the bridge config.
+			holdMs = Json.intField(body, "holdMs").orElse(p.defaultHoldMs());
 			restValue = Json.intField(body, "restValue").orElse(0);
 		}
 		catch (IllegalArgumentException e)
@@ -260,7 +267,7 @@ public final class WebServer
 
 		if (holdMs < p.minHoldMs() || holdMs > p.maxHoldMs())
 		{
-			sendError(ex, 400, "holdMs out of range (" + p.minHoldMs() + ".." + p.maxHoldMs() + ") for '" + p.name() + "': " + holdMs);
+			sendError(ex, 400, "holdMs out of range (" + p.minHoldMs() + ".." + p.maxHoldMs() + ") for '" + asName + "': " + holdMs);
 			return;
 		}
 		if (p.kind() == RegisterKind.HOLDING_REGISTERS && (outOfRegisterRange(value) || outOfRegisterRange(restValue)))
@@ -271,9 +278,15 @@ public final class WebServer
 
 		switch (pulse.pulse(p, value, holdMs, restValue))
 		{
-			case ACCEPTED -> sendJson(ex, 200, sampleJson(service.sample(p.name())).put("holdMs", holdMs).put("restValue", restValue).build());
+			case ACCEPTED ->
+			{
+				// PulseService's own log lines only know the point; this line ties the pulse
+				// back to the restapi id (e.g. the production lane) that requested it.
+				log.info("Pulse accepted for {} = {} (hold {} ms)", logName(p, asName), value, holdMs);
+				sendJson(ex, 200, sampleJson(service.sample(p.name()), asName).put("holdMs", holdMs).put("restValue", restValue).build());
+			}
 			case WRITE_FAILED -> sendError(ex, 503, "Modbus write failed: link down");
-			case QUEUE_FULL -> sendError(ex, 409, "too many pending pulses for '" + p.name() + "'");
+			case QUEUE_FULL -> sendError(ex, 409, "too many pending pulses for '" + asName + "'");
 		}
 	}
 
@@ -282,11 +295,11 @@ public final class WebServer
 		return value < 0 || value > 0xFFFF;
 	}
 
-	private void writePoint(HttpExchange ex, ModbusPoint p) throws IOException
+	private void writePoint(HttpExchange ex, ModbusPoint p, String asName) throws IOException
 	{
 		if (!p.writable())
 		{
-			sendError(ex, 400, "point '" + p.name() + "' is read-only (" + p.kind().name() + ")");
+			sendError(ex, 400, "point '" + asName + "' is read-only (" + p.kind().name() + ")");
 			return;
 		}
 
@@ -312,8 +325,8 @@ public final class WebServer
 			// Simulated point: the write is absorbed by the cache — same validation, same
 			// response shape, no wire. Callers cannot tell this from a live write.
 			service.update(p.name(), p.kind() == RegisterKind.COILS ? (value != 0 ? 1 : 0) : value);
-			log.info("Wrote {} = {} (simulated)", p.name(), value);
-			sendJson(ex, 200, sampleJson(service.sample(p.name())).build());
+			log.info("Wrote {} = {} (simulated)", logName(p, asName), value);
+			sendJson(ex, 200, sampleJson(service.sample(p.name()), asName).build());
 			return;
 		}
 
@@ -329,16 +342,22 @@ public final class WebServer
 			}
 			int readBack = readBack(p);
 			service.update(p.name(), readBack);
-			log.info("Wrote {} = {} (read back {})", p.name(), value, readBack);
+			log.info("Wrote {} = {} (read back {})", logName(p, asName), value, readBack);
 		}
 		catch (Exception e)
 		{
-			log.warn("Write of '{}' = {} failed: {}", p.name(), value, e.getMessage());
+			log.warn("Write of '{}' = {} failed: {}", logName(p, asName), value, e.getMessage());
 			sendError(ex, 503, "Modbus write failed: " + e.getMessage());
 			return;
 		}
 
-		sendJson(ex, 200, sampleJson(service.sample(p.name())).build());
+		sendJson(ex, 200, sampleJson(service.sample(p.name()), asName).build());
+	}
+
+	/** The point's own name, annotated with the restapi id the caller used when they differ. */
+	private static String logName(ModbusPoint p, String asName)
+	{
+		return asName.equals(p.name()) ? p.name() : p.name() + " (as " + asName + ")";
 	}
 
 	private int readBack(ModbusPoint p) throws Exception
@@ -359,15 +378,33 @@ public final class WebServer
 			sendError(ex, 405, "method not allowed");
 			return;
 		}
-		// simulatedPoints / modbusEnabled are diagnostics for the operator (the web UI tags
-		// simulated rows from them); the points payload itself deliberately carries no
-		// simulation marker so the client<->bridge conversation is unchanged.
+		// simulatedPoints / modbusEnabled / restIds are diagnostics for the operator (the web
+		// UI tags simulated rows and lists each point's restapi ids from them); the points
+		// payload itself deliberately carries no simulation marker so the client<->bridge
+		// conversation is unchanged.
 		Json.Arr simulated = Json.arr();
+		Json.Obj restIds = Json.obj();
 		for (ModbusPoint p : service.points())
 		{
 			if (p.simulate())
 			{
 				simulated.add(p.name());
+			}
+			Json.Arr ids = null;
+			for (RestApiId id : cfg.restIds())
+			{
+				if (id.point().equals(p.name()))
+				{
+					if (ids == null)
+					{
+						ids = Json.arr();
+					}
+					ids.add(id.name());
+				}
+			}
+			if (ids != null)
+			{
+				restIds.putRaw(p.name(), ids.build());
 			}
 		}
 		sendJson(ex, 200, Json.obj()
@@ -382,6 +419,7 @@ public final class WebServer
 			.put("lastPollMillis", service.lastPollMillis())
 			.put("pointCount", service.points().size())
 			.putRaw("simulatedPoints", simulated.build())
+			.putRaw("restIds", restIds.build())
 			.build());
 	}
 
@@ -527,9 +565,19 @@ public final class WebServer
 
 	private static Json.Obj sampleJson(Sample s)
 	{
+		return sampleJson(s, s.point().name());
+	}
+
+	/**
+	 * {@code asName} is the name the caller addressed the point by — its own name or a
+	 * restapi id — and is echoed back as {@code name}, so a caller using an id sees a point
+	 * of that name (the list payload always uses the point's own name).
+	 */
+	private static Json.Obj sampleJson(Sample s, String asName)
+	{
 		ModbusPoint p = s.point();
 		Json.Obj o = Json.obj()
-			.put("name", p.name())
+			.put("name", asName)
 			.put("kind", p.kind().name())
 			.put("address", p.address())
 			.put("writable", p.writable())

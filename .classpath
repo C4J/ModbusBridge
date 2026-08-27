@@ -19,9 +19,9 @@
 	<classpathentry kind="lib" path="lib/netty-transport-native-unix-common-4.2.15.Final.jar"/>
 	<classpathentry kind="lib" path="lib/slf4j-api-2.0.17.jar"/>
 	<classpathentry kind="lib" path="lib/strict-machine-1.0.0.jar"/>
-	<classpathentry kind="lib" path="lib/log4j-api-2.25.4.jar"/>
-	<classpathentry kind="lib" path="lib/log4j-core-2.25.4.jar"/>
-	<classpathentry kind="lib" path="lib/log4j-slf4j2-impl-2.25.4.jar"/>
+	<classpathentry kind="lib" path="lib/log4j-api-2.25.5.jar"/>
+	<classpathentry kind="lib" path="lib/log4j-core-2.25.5.jar"/>
+	<classpathentry kind="lib" path="lib/log4j-slf4j2-impl-2.25.5.jar"/>
 	<classpathentry kind="lib" path="lib/modbusClient.jar"/>
 	<classpathentry kind="output" path="bin"/>
 </classpath>

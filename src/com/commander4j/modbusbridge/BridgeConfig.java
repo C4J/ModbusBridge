@@ -23,11 +23,15 @@ import java.util.List;
  *                       applied in {@link ConfigStore}). The enforced bounds live on each
  *                       {@link ModbusPoint}.
  * @param points         the named points to track, in declaration order
+ * @param restIds        application-facing names from the optional {@code <restapi>} section,
+ *                       each resolving to one of the {@code points} (several ids may share a
+ *                       point — see {@link RestApiId}); empty when the section is absent
  */
-public record BridgeConfig(String host, int port, int unitId, int pollIntervalMs, boolean modbusEnabled, String webHost, int webPort, int maxHoldMs, List<ModbusPoint> points)
+public record BridgeConfig(String host, int port, int unitId, int pollIntervalMs, boolean modbusEnabled, String webHost, int webPort, int maxHoldMs, List<ModbusPoint> points, List<RestApiId> restIds)
 {
 	public BridgeConfig
 	{
 		points = List.copyOf(points);
+		restIds = List.copyOf(restIds);
 	}
 }

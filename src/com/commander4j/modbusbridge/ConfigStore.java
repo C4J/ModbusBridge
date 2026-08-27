@@ -20,6 +20,10 @@ import com.commander4j.modbus.RegisterKind;
  *   <modbus>    <ip>192.168.1.50</ip> <port>502</port> <id>1</id>
  *               <pollIntervalMs>500</pollIntervalMs> </modbus>
  *   <webserver> <ip>0.0.0.0</ip> <port>8080</port> </webserver>
+ *   <restapi>
+ *     <id name="LANEA" point="pump_run" caseSensitive="false"/>
+ *     <id name="LANEB" point="pump_run" caseSensitive="false"/>
+ *   </restapi>
  *   <points>
  *     <point name="pump_run"   kind="COIL"             address="0"/>
  *     <point name="tank_level" kind="HOLDING_REGISTER" address="100"/>
@@ -29,7 +33,9 @@ import com.commander4j.modbus.RegisterKind;
  *
  * <p>Read-only for now; a save path will follow when the web UI gains config editing.
  * The {@code kind} attribute accepts the singular forms shown above (the names an
- * operator naturally writes) and maps them to {@link RegisterKind}.
+ * operator naturally writes) and maps them to {@link RegisterKind}. The optional
+ * {@code <restapi>} section maps application-facing ids onto points (see {@link RestApiId});
+ * ids and point names share one namespace, validated here.
  */
 public final class ConfigStore
 {
@@ -94,7 +100,107 @@ public final class ConfigStore
 			throw new IllegalArgumentException("config defines no <point> entries");
 		}
 
-		return new BridgeConfig(host, port, unitId, pollIntervalMs, modbusEnabled, webHost, webPort, maxHoldMs, points);
+		List<RestApiId> restIds = readRestIds(doc, points);
+
+		return new BridgeConfig(host, port, unitId, pollIntervalMs, modbusEnabled, webHost, webPort, maxHoldMs, points, restIds);
+	}
+
+	/**
+	 * Reads the optional {@code <restapi>} section:
+	 * {@code <id name="LANEA" point="PLC_Link1" caseSensitive="false"/>}. Each id must
+	 * reference an existing point by name. Ids and point names share one namespace: exact
+	 * duplicates are rejected, and a case-<em>insensitive</em> id (the default) reserves its
+	 * whole case class, so nothing else may differ from it only by capitalisation. Two
+	 * case-sensitive entries differing only in case remain legal.
+	 *
+	 * <p>Scoped to the {@code <restapi>} element because {@code <modbus>} also has an
+	 * {@code <id>} child — a document-wide tag search would swallow the unit id.
+	 */
+	private static List<RestApiId> readRestIds(Document doc, List<ModbusPoint> points)
+	{
+		List<RestApiId> ids = new ArrayList<>();
+		NodeList sections = doc.getElementsByTagName("restapi");
+		if (sections.getLength() == 0)
+		{
+			return ids;
+		}
+
+		List<String> exact = new ArrayList<>();   // every identifier, as written
+		List<String> folded = new ArrayList<>();  // every identifier, lower-cased
+		List<String> foldedInsensitive = new ArrayList<>(); // case classes claimed by insensitive ids
+		List<String> pointNames = new ArrayList<>();
+		for (ModbusPoint p : points)
+		{
+			pointNames.add(p.name());
+			exact.add(p.name());
+			folded.add(fold(p.name()));
+		}
+
+		NodeList nodes = ((Element) sections.item(0)).getElementsByTagName("id");
+		for (int i = 0; i < nodes.getLength(); i++)
+		{
+			Element e = (Element) nodes.item(i);
+			String name = idAttr(e, "name");
+			String point = idAttr(e, "point");
+			boolean caseSensitive = caseSensitiveAttr(e, name);
+
+			if (!pointNames.contains(point))
+			{
+				throw new IllegalArgumentException("restapi id '" + name + "' references unknown point: " + point);
+			}
+			if (exact.contains(name))
+			{
+				throw new IllegalArgumentException("duplicate name: '" + name + "' is already a point name or restapi id");
+			}
+			if (foldedInsensitive.contains(fold(name)))
+			{
+				throw new IllegalArgumentException("restapi id '" + name + "' collides with a case-insensitive id differing only in case");
+			}
+			if (!caseSensitive && folded.contains(fold(name)))
+			{
+				throw new IllegalArgumentException("case-insensitive restapi id '" + name + "' collides with an existing name differing only in case");
+			}
+
+			exact.add(name);
+			folded.add(fold(name));
+			if (!caseSensitive)
+			{
+				foldedInsensitive.add(fold(name));
+			}
+			ids.add(new RestApiId(name, point, caseSensitive));
+		}
+		return ids;
+	}
+
+	private static String fold(String name)
+	{
+		return name.toLowerCase(java.util.Locale.ROOT);
+	}
+
+	/** Parses the optional {@code caseSensitive} attribute on an {@code <id>}; absent → false. */
+	private static boolean caseSensitiveAttr(Element e, String idName)
+	{
+		String raw = e.getAttribute("caseSensitive").trim();
+		if (raw.isEmpty())
+		{
+			raw = e.getAttribute("casesensitive").trim(); // accept the all-lowercase spelling too
+		}
+		return switch (raw.toLowerCase(java.util.Locale.ROOT))
+		{
+			case "", "false" -> false;
+			case "true" -> true;
+			default -> throw new IllegalArgumentException("restapi id '" + idName + "' has invalid caseSensitive (expected true/false): " + raw);
+		};
+	}
+
+	private static String idAttr(Element e, String name)
+	{
+		String v = e.getAttribute(name);
+		if (v == null || v.isBlank())
+		{
+			throw new IllegalArgumentException("restapi <id> missing '" + name + "' attribute");
+		}
+		return v.trim();
 	}
 
 	private static List<ModbusPoint> readPoints(Document doc, int globalMaxHoldMs)

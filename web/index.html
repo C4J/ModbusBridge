@@ -26,6 +26,8 @@
     .ro { color: #888; font-size: .85rem; }
     /* Simulated points (from /api/status) — live-looking to REST callers, tagged for the operator. */
     tr.sim td.kind::after { content: " · simulated"; font-size: .8rem; color: #888; font-style: italic; }
+    /* restapi ids mapped onto the point (from /api/status), shown under its name. */
+    .restids { display: block; font-size: .75rem; color: #888; font-style: italic; }
     input[type=number], input.coil { width: 6rem; }
     input.hold { width: 5rem; margin-left: .75rem; }
     .unit { font-size: .8rem; color: #888; margin-left: .15rem; }
@@ -87,6 +89,8 @@
         }
         row.classList.toggle('stale', !!p.stale);
         row.classList.toggle('sim', simulatedSet.has(p.name));
+        const ids = restIdMap[p.name] || [];
+        row.querySelector('.restids').textContent = ids.length ? 'ids: ' + ids.join(', ') : '';
         const valCell = row.querySelector('.value');
         valCell.textContent = p.valid ? p.value : '—';
         // Don't clobber an input the user is actively editing.
@@ -102,7 +106,7 @@
       const tr = document.createElement('tr');
       tr.id = 'pt-' + p.name;
       tr.innerHTML =
-        '<td>' + escapeHtml(p.name) + '</td>' +
+        '<td>' + escapeHtml(p.name) + '<span class="restids"></span></td>' +
         '<td class="kind">' + escapeHtml(p.kind) + '</td>' +
         '<td>' + p.address + '</td>' +
         '<td class="value"></td>' +
@@ -212,13 +216,16 @@
 
     document.getElementById('refresh').addEventListener('click', refresh);
 
-    // Operator-only diagnostics: which points are simulated, and whether the Modbus link
-    // is switched off in config. Deliberately NOT part of the points payload — the
-    // client<->bridge conversation must not reveal simulation — so fetch it separately.
+    // Operator-only diagnostics: which points are simulated, whether the Modbus link is
+    // switched off in config, and each point's restapi ids. Deliberately NOT part of the
+    // points payload — the client<->bridge conversation must not reveal simulation — so
+    // fetch it separately.
     let simulatedSet = new Set();
+    let restIdMap = {};
     let modbusDisabled = false;
     fetch('/api/status').then(r => r.json()).then(s => {
       simulatedSet = new Set(s.simulatedPoints || []);
+      restIdMap = s.restIds || {};
       modbusDisabled = (s.modbusEnabled === false);
       refresh(); // re-render so existing rows pick up the tags
     }).catch(() => {});

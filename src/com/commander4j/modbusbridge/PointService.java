@@ -2,8 +2,10 @@ package com.commander4j.modbusbridge;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -28,12 +30,19 @@ public final class PointService
 	}
 
 	private final Map<String, Sample> samples = new LinkedHashMap<>();
+
+	/** Point names + case-sensitive restapi ids → the point name keying {@link #samples}. */
+	private final Map<String, String> exactNames = new HashMap<>();
+
+	/** Case-insensitive restapi ids, lower-cased → the point name keying {@link #samples}. */
+	private final Map<String, String> foldedNames = new HashMap<>();
+
 	private final List<ModbusPoint> points;
 	private final AtomicBoolean connected = new AtomicBoolean(false);
 	private volatile long lastPollMillis = 0;
 	private volatile Runnable changeListener = () -> {};
 
-	public PointService(List<ModbusPoint> points)
+	public PointService(List<ModbusPoint> points, List<RestApiId> restIds)
 	{
 		this.points = List.copyOf(points);
 		for (ModbusPoint p : this.points)
@@ -41,7 +50,36 @@ public final class PointService
 			// Simulated points are born valid at their seed value and never go stale;
 			// real points start invalid/stale until the first successful read.
 			samples.put(p.name(), p.simulate() ? new Sample(p, p.initialValue(), true, false) : new Sample(p, 0, false, true));
+			exactNames.put(p.name(), p.name());
 		}
+		for (RestApiId id : restIds)
+		{
+			if (id.caseSensitive())
+			{
+				exactNames.put(id.name(), id.point());
+			}
+			else
+			{
+				foldedNames.put(id.name().toLowerCase(Locale.ROOT), id.point());
+			}
+		}
+	}
+
+	/**
+	 * Resolves a caller-supplied name — a point name or a restapi id, honouring each id's
+	 * case sensitivity — to the point name keying {@link #samples}. Exact matches win;
+	 * unknown names pass through unchanged so the lookup then simply misses. {@code ConfigStore}
+	 * validation guarantees a case-insensitive id's case class collides with nothing, so the
+	 * two-step lookup cannot be ambiguous.
+	 */
+	private String pointName(String name)
+	{
+		String exact = exactNames.get(name);
+		if (exact != null)
+		{
+			return exact;
+		}
+		return foldedNames.getOrDefault(name.toLowerCase(Locale.ROOT), name);
 	}
 
 	public List<ModbusPoint> points()
@@ -95,13 +133,14 @@ public final class PointService
 		boolean changed;
 		synchronized (this)
 		{
-			Sample prev = samples.get(name);
+			String key = pointName(name);
+			Sample prev = samples.get(key);
 			if (prev == null)
 			{
 				throw new IllegalArgumentException("unknown point: " + name);
 			}
 			changed = !prev.valid() || prev.stale() || prev.value() != value;
-			samples.put(name, new Sample(prev.point(), value, true, false));
+			samples.put(key, new Sample(prev.point(), value, true, false));
 		}
 		if (changed)
 		{
@@ -136,9 +175,10 @@ public final class PointService
 		}
 	}
 
+	/** Looks a point up by its own name or any restapi id that maps to it. */
 	public synchronized Sample sample(String name)
 	{
-		return samples.get(name);
+		return samples.get(pointName(name));
 	}
 
 	/** A point-in-time copy of every sample, in configuration order. */

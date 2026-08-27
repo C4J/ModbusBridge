@@ -19,7 +19,7 @@ import java.io.File;
 public final class CommonBridge
 {
 	public static final String programName = "Commander4j Modbus Bridge";
-	public static final String version     = "1.30";
+	public static final String version     = "1.60";
 	public static final String helpURL     = "https://wiki.commander4j.com/index.php?title=ModbusBridge";
 
 	/** Conventional on-disk locations, relative to the working directory. */
